@@ -231,6 +231,25 @@ func AllAggregationSets(qname string) string {
 	return QueueKeyPrefix(qname) + "aggregation_sets"
 }
 
+// SnapshotProgressKey returns a redis key for the SET that tracks the task IDs
+// already handled by an in-progress restore of the given snapshot. It is a
+// single, global key (no queue hash tag) because it is always accessed alone.
+//
+// The epoch (the snapshot's creation time) scopes progress to one concrete
+// restore point file: if a custom snapshot ID is ever reused for a new file,
+// the new epoch yields a fresh key so stale progress cannot suppress restores.
+// The progress set is operational state only: if lost, a re-run of the restore
+// re-verifies every record and remains correct.
+func SnapshotProgressKey(snapshotID string, epoch int64) string {
+	return fmt.Sprintf("asynq:snapshot:restore:%s:%d:done", snapshotID, epoch)
+}
+
+// SnapshotProgressKeyPattern returns the glob pattern matching every progress
+// key belonging to the given snapshot ID, used when deleting a restore point.
+func SnapshotProgressKeyPattern(snapshotID string) string {
+	return "asynq:snapshot:restore:" + snapshotID + ":*"
+}
+
 // TaskMessage is the internal representation of a task with additional metadata fields.
 // Serialized data of this type gets written to redis.
 type TaskMessage struct {

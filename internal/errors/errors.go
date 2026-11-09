@@ -239,6 +239,40 @@ func IsTaskAlreadyArchived(err error) bool {
 	return As(err, &target)
 }
 
+// SnapshotTaskConflictError indicates that a live task with the same ID exists
+// but its content differs from the restore point record, so the restore must
+// not proceed.
+type SnapshotTaskConflictError struct {
+	Queue string // queue name
+	ID    string // task id
+}
+
+func (e *SnapshotTaskConflictError) Error() string {
+	return fmt.Sprintf("snapshot conflict: task with id=%s in queue %q exists with different content", e.ID, e.Queue)
+}
+
+// IsSnapshotTaskConflict reports whether any error in err's chain is of type SnapshotTaskConflictError.
+func IsSnapshotTaskConflict(err error) bool {
+	var target *SnapshotTaskConflictError
+	return As(err, &target)
+}
+
+// SnapshotCorruptError indicates that a restore point record cannot be read or
+// decoded, so the restore must fail before any write is performed.
+type SnapshotCorruptError struct {
+	Reason string // human-readable description of the corruption
+}
+
+func (e *SnapshotCorruptError) Error() string {
+	return fmt.Sprintf("snapshot corrupt: %s", e.Reason)
+}
+
+// IsSnapshotCorrupt reports whether any error in err's chain is of type SnapshotCorruptError.
+func IsSnapshotCorrupt(err error) bool {
+	var target *SnapshotCorruptError
+	return As(err, &target)
+}
+
 // RedisCommandError indicates that the given redis command returned error.
 type RedisCommandError struct {
 	Command string // redis command (e.g. LRANGE, ZADD, etc)
