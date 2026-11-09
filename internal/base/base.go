@@ -231,6 +231,16 @@ func AllAggregationSets(qname string) string {
 	return QueueKeyPrefix(qname) + "aggregation_sets"
 }
 
+// PayloadVersionHeader is the reserved task header key that records the
+// payload schema version a task's payload has been migrated to.
+//
+// The payload migration machinery owns this header: it is written when a
+// task payload is migrated and read on subsequent runs to make migration
+// idempotent. User code should not set or overwrite it. The header value is
+// the decimal representation of the target migration version; a missing
+// header means the task has never been migrated.
+const PayloadVersionHeader = "asynq:payload-version"
+
 // TaskMessage is the internal representation of a task with additional metadata fields.
 // Serialized data of this type gets written to redis.
 type TaskMessage struct {
