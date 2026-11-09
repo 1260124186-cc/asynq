@@ -565,23 +565,36 @@ func parseRedisSentinelURI(u *url.URL) (RedisConnOpt, error) {
 // ResultWriter is a client interface to write result data for a task.
 // It writes the data to the redis instance the server is connected to.
 type ResultWriter struct {
-	id     string // task ID this writer is responsible for
-	qname  string // queue name the task belongs to
-	broker base.Broker
-	ctx    context.Context // context associated with the task
+	id      string // task ID this writer is responsible for
+	qname   string // queue name the task belongs to
+	attempt int    // 1-based execution attempt this writer belongs to
+	broker  base.Broker
+	ctx     context.Context // context associated with the task
 }
 
-// Write writes the given data as a result of the task the ResultWriter is associated with.
+// Write writes the given data as a result of the task attempt the ResultWriter
+// is associated with.
+//
+// Each execution attempt keeps an independent result record. Calling Write
+// repeatedly within the same attempt replaces that single record instead of
+// creating additional records. The record is never marked final by Write; the
+// final result is only adopted when the task completes successfully.
 func (w *ResultWriter) Write(data []byte) (n int, err error) {
 	select {
 	case <-w.ctx.Done():
 		return 0, fmt.Errorf("failed to write task result: %w", w.ctx.Err())
 	default:
 	}
-	return w.broker.WriteResult(w.qname, w.id, data)
+	return w.broker.WriteAttemptResult(w.qname, w.id, w.attempt, data)
 }
 
 // TaskID returns the ID of the task the ResultWriter is associated with.
 func (w *ResultWriter) TaskID() string {
 	return w.id
+}
+
+// Attempt returns the 1-based execution attempt number of the task run this
+// writer is associated with.
+func (w *ResultWriter) Attempt() int {
+	return w.attempt
 }

@@ -211,7 +211,105 @@ var (
 
 	// ErrTaskNotFound indicates that the specified task cannot be found in the queue.
 	ErrTaskNotFound = errors.New("task not found")
+
+	// ErrAttemptResultCorrupted indicates that a stored attempt result record is
+	// corrupted. The stored lineage is left untouched.
+	ErrAttemptResultCorrupted = errors.New("attempt result record is corrupted")
+
+	// ErrAttemptResultConflict indicates that an attempt result record does not
+	// match the task attempt number, or that the lineage was already finalized.
+	// The stored lineage is left untouched.
+	ErrAttemptResultConflict = errors.New("attempt result conflict")
 )
+
+// AttemptStatus describes the state of a single task execution attempt result.
+type AttemptStatus int
+
+const (
+	// AttemptStatusIncomplete indicates that the attempt ended without reporting
+	// a result, e.g. because the worker process crashed or its lease expired. A
+	// placeholder record is retained so the attempt lineage has no gaps.
+	AttemptStatusIncomplete AttemptStatus = iota + 1
+
+	// AttemptStatusRecorded indicates that the handler reported a result for the
+	// attempt. The attempt itself may still have ended in failure.
+	AttemptStatusRecorded
+
+	// AttemptStatusFinal indicates that this attempt's result was adopted as the
+	// final task result. It is only set once the task completes successfully.
+	AttemptStatusFinal
+)
+
+func (s AttemptStatus) String() string {
+	switch s {
+	case AttemptStatusIncomplete:
+		return "incomplete"
+	case AttemptStatusRecorded:
+		return "recorded"
+	case AttemptStatusFinal:
+		return "final"
+	default:
+		return "unknown"
+	}
+}
+
+// AttemptResult is an independently retained result record for one task
+// execution attempt.
+type AttemptResult struct {
+	// Attempt is the 1-based execution attempt number.
+	Attempt int
+
+	// Status is the lifecycle state of this record.
+	Status AttemptStatus
+
+	// Result holds the raw result bytes reported by the handler. It is nil for
+	// incomplete placeholder records.
+	Result []byte
+
+	// WrittenAt is the time the record was last written.
+	WrittenAt time.Time
+
+	// Final reports whether this record's result was adopted as the final result.
+	Final bool
+}
+
+// ListTaskAttemptResults returns every retained result record for the task's
+// execution attempts, ordered by the 1-based attempt number. Failed attempts
+// are retained alongside the successful one; the Final field identifies the
+// adopted result.
+//
+// Returns an error wrapping ErrQueueNotFound if the queue does not exist,
+// ErrTaskNotFound if the task does not exist, ErrAttemptResultCorrupted or
+// ErrAttemptResultConflict if the stored lineage cannot be decoded.
+func (i *Inspector) ListTaskAttemptResults(queue, id string) ([]*AttemptResult, error) {
+	if err := base.ValidateQueueName(queue); err != nil {
+		return nil, err
+	}
+	records, err := i.rdb.ListAttemptResults(queue, id)
+	switch {
+	case errors.IsQueueNotFound(err):
+		return nil, fmt.Errorf("asynq: %w", ErrQueueNotFound)
+	case errors.IsTaskNotFound(err):
+		return nil, fmt.Errorf("asynq: %w", ErrTaskNotFound)
+	case errors.Is(err, errors.ErrAttemptResultCorrupted):
+		return nil, fmt.Errorf("asynq: %w", ErrAttemptResultCorrupted)
+	case errors.Is(err, errors.ErrAttemptResultConflict):
+		return nil, fmt.Errorf("asynq: %w", ErrAttemptResultConflict)
+	case err != nil:
+		return nil, fmt.Errorf("asynq: %w", err)
+	}
+	out := make([]*AttemptResult, 0, len(records))
+	for _, rec := range records {
+		out = append(out, &AttemptResult{
+			Attempt:   rec.Attempt,
+			Status:    AttemptStatus(rec.Status),
+			Result:    rec.Data,
+			WrittenAt: rec.WrittenAt,
+			Final:     rec.IsFinal(),
+		})
+	}
+	return out, nil
+}
 
 // DeleteQueue removes the specified queue.
 //

@@ -174,6 +174,17 @@ var (
 
 	// ErrTaskIdConflict indicates that another task with the same task ID already exist
 	ErrTaskIdConflict = errors.New("task id conflicts with another task")
+
+	// ErrAttemptResultCorrupted indicates that a stored per-attempt result record
+	// cannot be decoded. Existing history must not be overwritten when this error
+	// is returned.
+	ErrAttemptResultCorrupted = errors.New("attempt result record is corrupted")
+
+	// ErrAttemptResultConflict indicates that a per-attempt result record does not
+	// match the task attempt number (e.g. the embedded attempt number disagrees with
+	// its storage slot, or a final result has already been adopted for another attempt).
+	// Existing history must not be overwritten when this error is returned.
+	ErrAttemptResultConflict = errors.New("attempt result record conflicts with the task attempt number")
 )
 
 // TaskNotFoundError indicates that a task with the given ID does not exist

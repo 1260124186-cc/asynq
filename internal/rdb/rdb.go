@@ -881,6 +881,8 @@ func (r *RDB) ScheduleUnique(ctx context.Context, msg *base.TaskMessage, process
 // ARGV[4] -> stats expiration timestamp
 // ARGV[5] -> is_failure (bool)
 // ARGV[6] -> max int64 value
+// ARGV[7] -> attempt number that just ended (Retried+1 before the increment)
+// ARGV[8] -> current time in Unix nano
 var retryCmd = redis.NewScript(`
 if redis.call("LREM", KEYS[2], 0, ARGV[1]) == 0 then
   return redis.error_reply("NOT FOUND")
@@ -890,6 +892,13 @@ if redis.call("ZREM", KEYS[3], ARGV[1]) == 0 then
 end
 redis.call("ZADD", KEYS[4], ARGV[3], ARGV[1])
 redis.call("HSET", KEYS[1], "msg", ARGV[2], "state", "retry")
+-- Backfill the attempt-result lineage when the attempt that just ended left no
+-- record (e.g. the worker process crashed or its lease expired). An existing
+-- record is never overwritten.
+local ar_field = "ar:" .. ARGV[7]
+if redis.call("HEXISTS", KEYS[1], ar_field) == 0 then
+  redis.call("HSET", KEYS[1], ar_field, "AR1:" .. ARGV[7] .. ":1:" .. ARGV[8] .. ":0\n")
+end
 if tonumber(ARGV[5]) == 1 then
 	local n = redis.call("INCR", KEYS[5])
 	if tonumber(n) == 1 then
@@ -944,6 +953,8 @@ func (r *RDB) Retry(ctx context.Context, msg *base.TaskMessage, processAt time.T
 		expireAt.Unix(),
 		isFailure,
 		int64(math.MaxInt64),
+		msg.Retried + 1, // the attempt whose execution just ended
+		r.clock.Now().UnixNano(),
 	}
 	return r.runScript(ctx, op, retryCmd, keys, argv...)
 }
@@ -970,6 +981,8 @@ const (
 // ARGV[5] -> max number of tasks in archive (e.g., 100)
 // ARGV[6] -> stats expiration timestamp
 // ARGV[7] -> max int64 value
+// ARGV[8] -> attempt number that just ended (Retried+1)
+// ARGV[9] -> current time in Unix nano
 var archiveCmd = redis.NewScript(`
 if redis.call("LREM", KEYS[2], 0, ARGV[1]) == 0 then
   return redis.error_reply("NOT FOUND")
@@ -995,6 +1008,12 @@ if #extra > 0 then
 end
 
 redis.call("HSET", KEYS[1], "msg", ARGV[2], "state", "archived")
+-- Backfill the attempt-result lineage when the final attempt left no record;
+-- an existing record is never overwritten.
+local ar_field = "ar:" .. ARGV[8]
+if redis.call("HEXISTS", KEYS[1], ar_field) == 0 then
+  redis.call("HSET", KEYS[1], ar_field, "AR1:" .. ARGV[8] .. ":1:" .. ARGV[9] .. ":0\n")
+end
 local n = redis.call("INCR", KEYS[5])
 if tonumber(n) == 1 then
 	redis.call("EXPIREAT", KEYS[5], ARGV[6])
@@ -1046,6 +1065,8 @@ func (r *RDB) Archive(ctx context.Context, msg *base.TaskMessage, errMsg string)
 		maxArchiveSize,
 		expireAt.Unix(),
 		int64(math.MaxInt64),
+		msg.Retried + 1, // the attempt whose execution just ended
+		now.UnixNano(),
 	}
 	return r.runScript(ctx, op, archiveCmd, keys, argv...)
 }
@@ -1657,15 +1678,4 @@ func (r *RDB) ClearSchedulerHistory(entryID string) error {
 		return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "del", Err: err})
 	}
 	return nil
-}
-
-// WriteResult writes the given result data for the specified task.
-func (r *RDB) WriteResult(qname, taskID string, data []byte) (int, error) {
-	var op errors.Op = "rdb.WriteResult"
-	ctx := context.Background()
-	taskKey := base.TaskKey(qname, taskID)
-	if err := r.client.HSet(ctx, taskKey, "result", data).Err(); err != nil {
-		return 0, errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "hset", Err: err})
-	}
-	return len(data), nil
 }

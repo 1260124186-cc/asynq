@@ -740,5 +740,23 @@ type Broker interface {
 	CancelationPubSub() (*redis.PubSub, error) // TODO: Need to decouple from redis to support other brokers
 	PublishCancelation(id string) error
 
-	WriteResult(qname, id string, data []byte) (n int, err error)
+	// WriteAttemptResult stores (or idempotently replaces) the result record of
+	// the given execution attempt. Repeated writes for the same attempt update a
+	// single record instead of creating additional records. The record is never
+	// marked final here; use MarkFinalResult after the task completes successfully.
+	// It returns ErrAttemptResultCorrupted or ErrAttemptResultConflict and leaves
+	// existing history untouched when the lineage cannot be safely extended.
+	WriteAttemptResult(qname, id string, attempt int, data []byte) (n int, err error)
+
+	// MarkFinalResult marks the record of the given attempt as the adopted final
+	// result. It must only be called once the task has completed successfully; a
+	// running attempt must not be marked final. If the attempt has no recorded
+	// result yet, an empty record is created so every attempt retains a record.
+	// Returns ErrAttemptResultConflict if a different attempt was already adopted.
+	MarkFinalResult(qname, id string, attempt int) error
+
+	// ListAttemptResults returns all retained attempt result records for the task,
+	// ordered by attempt number. It returns ErrAttemptResultCorrupted or
+	// ErrAttemptResultConflict if the stored lineage cannot be decoded.
+	ListAttemptResults(qname, id string) ([]*AttemptResult, error)
 }

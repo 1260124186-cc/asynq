@@ -224,10 +224,11 @@ func (p *processor) exec() {
 					msg.Type,
 					msg.Payload,
 					&ResultWriter{
-						id:     msg.ID,
-						qname:  msg.Queue,
-						broker: p.broker,
-						ctx:    ctx,
+						id:      msg.ID,
+						qname:   msg.Queue,
+						attempt: msg.Retried + 1,
+						broker:  p.broker,
+						ctx:     ctx,
 					},
 				)
 				task.headers = msg.Headers
@@ -288,6 +289,35 @@ func (p *processor) markAsComplete(l *base.Lease, msg *base.TaskMessage) {
 	}
 	ctx, cancel := context.WithDeadline(context.Background(), l.Deadline())
 	defer cancel()
+	attempt := msg.Retried + 1
+
+	// Adopt this attempt's record as the final result before moving the task to
+	// the completed set. A still-running attempt can never reach this code, so
+	// the final marker is never set prematurely.
+	finalErr := p.broker.MarkFinalResult(msg.Queue, msg.ID, attempt)
+	if finalErr != nil {
+		if isAttemptResultLineageError(finalErr) {
+			// The lineage is corrupted or inconsistent. Fail the task explicitly
+			// and leave every previously stored record untouched.
+			p.logger.Errorf("Task id=%s failed: refusing to finalize attempt-result lineage: %v", msg.ID, finalErr)
+			p.archive(l, msg, finalErr)
+			return
+		}
+		errMsg := fmt.Sprintf("Could not mark final result for task id=%s attempt=%d: %+v", msg.ID, attempt, finalErr)
+		p.logger.Warnf("%s; Will retry syncing", errMsg)
+		p.syncRequestCh <- &syncRequest{
+			fn: func() error {
+				if err := p.broker.MarkFinalResult(msg.Queue, msg.ID, attempt); err != nil {
+					return err
+				}
+				return p.broker.MarkAsComplete(ctx, msg)
+			},
+			errMsg:   errMsg,
+			deadline: l.Deadline(),
+		}
+		return
+	}
+
 	err := p.broker.MarkAsComplete(ctx, msg)
 	if err != nil {
 		errMsg := fmt.Sprintf("Could not move task id=%s type=%q from %q to %q:  %+v",
@@ -295,12 +325,25 @@ func (p *processor) markAsComplete(l *base.Lease, msg *base.TaskMessage) {
 		p.logger.Warnf("%s; Will retry syncing", errMsg)
 		p.syncRequestCh <- &syncRequest{
 			fn: func() error {
+				// MarkFinalResult is idempotent for the same attempt, so re-run it
+				// to cover the window where only one of the two writes landed.
+				if err := p.broker.MarkFinalResult(msg.Queue, msg.ID, attempt); err != nil {
+					return err
+				}
 				return p.broker.MarkAsComplete(ctx, msg)
 			},
 			errMsg:   errMsg,
 			deadline: l.Deadline(),
 		}
 	}
+}
+
+// isAttemptResultLineageError reports whether the error indicates a corrupted
+// or conflicting attempt-result record that must fail the task explicitly
+// instead of being retried or overwriting the stored history.
+func isAttemptResultLineageError(err error) bool {
+	return errors.Is(err, errors.ErrAttemptResultCorrupted) ||
+		errors.Is(err, errors.ErrAttemptResultConflict)
 }
 
 func (p *processor) markAsDone(l *base.Lease, msg *base.TaskMessage) {

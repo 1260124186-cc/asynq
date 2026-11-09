@@ -217,13 +217,31 @@ func (tb *TestBroker) PublishCancelation(id string) error {
 	return tb.real.PublishCancelation(id)
 }
 
-func (tb *TestBroker) WriteResult(qname, id string, data []byte) (int, error) {
+func (tb *TestBroker) WriteAttemptResult(qname, id string, attempt int, data []byte) (int, error) {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 	if tb.sleeping {
 		return 0, errRedisDown
 	}
-	return tb.real.WriteResult(qname, id, data)
+	return tb.real.WriteAttemptResult(qname, id, attempt, data)
+}
+
+func (tb *TestBroker) MarkFinalResult(qname, id string, attempt int) error {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.sleeping {
+		return errRedisDown
+	}
+	return tb.real.MarkFinalResult(qname, id, attempt)
+}
+
+func (tb *TestBroker) ListAttemptResults(qname, id string) ([]*base.AttemptResult, error) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.sleeping {
+		return nil, errRedisDown
+	}
+	return tb.real.ListAttemptResults(qname, id)
 }
 
 func (tb *TestBroker) Ping() error {
