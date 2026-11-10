@@ -174,6 +174,19 @@ var (
 
 	// ErrTaskIdConflict indicates that another task with the same task ID already exist
 	ErrTaskIdConflict = errors.New("task id conflicts with another task")
+
+	// ErrNodeIdentityConflict indicates that a different, still-live server instance
+	// already owns the same node identity. The reconciliation is rejected and the
+	// existing quarantine state is left untouched.
+	ErrNodeIdentityConflict = errors.New("node identity conflict: another active server owns this node identity")
+
+	// ErrQuarantineStateCorrupt indicates that the persisted quarantine record is
+	// missing required fields or holds malformed values. The reconciliation is
+	// rejected and the existing quarantine state is left untouched.
+	ErrQuarantineStateCorrupt = errors.New("quarantine state is corrupt")
+
+	// ErrNodeQuarantineNotFound indicates that no quarantine record exists for the given node.
+	ErrNodeQuarantineNotFound = errors.New("node quarantine record not found")
 )
 
 // TaskNotFoundError indicates that a task with the given ID does not exist

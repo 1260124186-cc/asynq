@@ -306,3 +306,66 @@ func (tb *TestBroker) ReclaimStaleAggregationSets(qname string) error {
 	}
 	return tb.real.ReclaimStaleAggregationSets(qname)
 }
+
+func (tb *TestBroker) ReportNodeFailure(ctx context.Context, nodeID, serverID, eventKey string, failureThreshold int) (status string, duplicated bool, err error) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.sleeping {
+		return "", false, errRedisDown
+	}
+	return tb.real.ReportNodeFailure(ctx, nodeID, serverID, eventKey, failureThreshold)
+}
+
+func (tb *TestBroker) RecordNodeHeartbeat(ctx context.Context, nodeID, serverID string, recoveryThreshold int) (status string, err error) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.sleeping {
+		return "", errRedisDown
+	}
+	return tb.real.RecordNodeHeartbeat(ctx, nodeID, serverID, recoveryThreshold)
+}
+
+func (tb *TestBroker) GetNodeQuarantine(nodeID string) (*base.NodeQuarantine, error) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.sleeping {
+		return nil, errRedisDown
+	}
+	return tb.real.GetNodeQuarantine(nodeID)
+}
+
+func (tb *TestBroker) ReconcileNodeQuarantine(nodeID, serverID string) (status string, err error) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.sleeping {
+		return "", errRedisDown
+	}
+	return tb.real.ReconcileNodeQuarantine(nodeID, serverID)
+}
+
+func (tb *TestBroker) ListNodeQuarantines() ([]*base.NodeQuarantine, error) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.sleeping {
+		return nil, errRedisDown
+	}
+	return tb.real.ListNodeQuarantines()
+}
+
+func (tb *TestBroker) ClearNodeQuarantine(ctx context.Context, nodeID, operator, reason string) error {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.sleeping {
+		return errRedisDown
+	}
+	return tb.real.ClearNodeQuarantine(ctx, nodeID, operator, reason)
+}
+
+func (tb *TestBroker) ListNodeQuarantineAudit(nodeID string) ([]*base.QuarantineAuditEntry, error) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.sleeping {
+		return nil, errRedisDown
+	}
+	return tb.real.ListNodeQuarantineAudit(nodeID)
+}

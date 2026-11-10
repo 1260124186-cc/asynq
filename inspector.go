@@ -5,6 +5,7 @@
 package asynq
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -1055,4 +1056,165 @@ func (i *Inspector) ListSchedulerEnqueueEvents(entryID string, opts ...ListOptio
 		events = append(events, &SchedulerEnqueueEvent{TaskID: e.TaskID, EnqueuedAt: e.EnqueuedAt})
 	}
 	return events, nil
+}
+
+// Node quarantine statuses, mirroring the persisted record lifecycle.
+const (
+	// NodeQuarantineHealthy means the node is allowed to pull tasks (it may still be
+	// accumulating failures before reaching the quarantine threshold).
+	NodeQuarantineHealthy = base.NodeQuarantineHealthy
+
+	// NodeQuarantineQuarantined means the node is isolated and not pulling new tasks.
+	NodeQuarantineQuarantined = base.NodeQuarantineQuarantined
+
+	// NodeQuarantineReleased means a previously quarantined node has been released.
+	NodeQuarantineReleased = base.NodeQuarantineReleased
+)
+
+// NodeQuarantineInfo describes the persisted quarantine state of a worker node.
+type NodeQuarantineInfo struct {
+	// NodeID is the stable identity of the worker node.
+	NodeID string
+
+	// ServerID is the server instance currently owning the record.
+	ServerID string
+
+	// Status is one of the NodeQuarantine* constants.
+	Status string
+
+	// FailCount is the number of distinct failure events in the current window.
+	FailCount int
+
+	// HealthyStreak is the count of consecutive healthy heartbeats while quarantined.
+	HealthyStreak int
+
+	// FirstFailAt is the time of the first failure event in the current window.
+	FirstFailAt time.Time
+
+	// LastFailAt is the time of the most recent distinct failure event.
+	LastFailAt time.Time
+
+	// QuarantinedAt is the time the node most recently became quarantined.
+	QuarantinedAt time.Time
+
+	// ReleasedAt is the time the node most recently left the quarantined status.
+	ReleasedAt time.Time
+
+	// LastEventKey is the idempotency key of the most recently processed failure event.
+	LastEventKey string
+
+	// ClearedBy is the operator that manually cleared the quarantine, if any.
+	ClearedBy string
+
+	// ClearReason is the reason supplied with the most recent manual clear.
+	ClearReason string
+
+	// UpdatedAt is the time the record was last mutated.
+	UpdatedAt time.Time
+
+	// Version is the monotonically increasing record revision.
+	Version int64
+}
+
+// QuarantineAuditEntry is one immutable record in a node's quarantine audit trail.
+type QuarantineAuditEntry struct {
+	// At is the time the entry was written.
+	At time.Time
+
+	// NodeID is the node identity the entry belongs to.
+	NodeID string
+
+	// Action is the action that produced the entry: "quarantined",
+	// "auto_released" or "manual_clear".
+	Action string
+
+	// Operator is "system" for automatic transitions or the operator that
+	// performed a manual clear.
+	Operator string
+
+	// Reason is a human readable explanation of the entry.
+	Reason string
+
+	// ServerID is the server instance that produced the entry, when applicable.
+	ServerID string
+
+	// Status is the resulting node status after the action.
+	Status string
+}
+
+func toNodeQuarantineInfo(rec *base.NodeQuarantine) *NodeQuarantineInfo {
+	return &NodeQuarantineInfo{
+		NodeID:        rec.NodeID,
+		ServerID:      rec.ServerID,
+		Status:        rec.Status,
+		FailCount:     rec.FailCount,
+		HealthyStreak: rec.HealthyStreak,
+		FirstFailAt:   rec.FirstFailAt,
+		LastFailAt:    rec.LastFailAt,
+		QuarantinedAt: rec.QuarantinedAt,
+		ReleasedAt:    rec.ReleasedAt,
+		LastEventKey:  rec.LastEventKey,
+		ClearedBy:     rec.ClearedBy,
+		ClearReason:   rec.ClearReason,
+		UpdatedAt:     rec.UpdatedAt,
+		Version:       rec.Version,
+	}
+}
+
+// GetNodeQuarantine returns the persisted quarantine record for the given node.
+// It returns an error wrapping ErrNodeQuarantineNotFound when no record exists.
+func (i *Inspector) GetNodeQuarantine(nodeID string) (*NodeQuarantineInfo, error) {
+	rec, err := i.rdb.GetNodeQuarantine(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	return toNodeQuarantineInfo(rec), nil
+}
+
+// ListNodeQuarantines returns all known node quarantine records, including nodes
+// that are merely observing failures or have already been released.
+func (i *Inspector) ListNodeQuarantines() ([]*NodeQuarantineInfo, error) {
+	recs, err := i.rdb.ListNodeQuarantines()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*NodeQuarantineInfo, 0, len(recs))
+	for _, rec := range recs {
+		out = append(out, toNodeQuarantineInfo(rec))
+	}
+	return out, nil
+}
+
+// ClearNodeQuarantine manually lifts the quarantine for the given node and writes
+// an immutable audit entry. The operator and reason are recorded verbatim so the
+// intervention is traceable.
+//
+// It fails without changing state when the record is missing or corrupt.
+func (i *Inspector) ClearNodeQuarantine(nodeID, operator, reason string) error {
+	if operator == "" {
+		operator = "manual"
+	}
+	return i.rdb.ClearNodeQuarantine(context.Background(), nodeID, operator, reason)
+}
+
+// GetNodeQuarantineAudit returns the audit trail for the given node, oldest first.
+// The trail captures automatic quarantine, automatic release and manual clears.
+func (i *Inspector) GetNodeQuarantineAudit(nodeID string) ([]*QuarantineAuditEntry, error) {
+	entries, err := i.rdb.ListNodeQuarantineAudit(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*QuarantineAuditEntry, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, &QuarantineAuditEntry{
+			At:       e.At,
+			NodeID:   e.NodeID,
+			Action:   e.Action,
+			Operator: e.Operator,
+			Reason:   e.Reason,
+			ServerID: e.ServerID,
+			Status:   e.Status,
+		})
+	}
+	return out, nil
 }

@@ -32,9 +32,18 @@ type heartbeater struct {
 	host           string
 	pid            int
 	serverID       string
+	nodeID         string
 	concurrency    int
 	queues         map[string]int
 	strictPriority bool
+
+	// reporter feeds heartbeat outcomes and task-lease failures into the node
+	// quarantine subsystem. It may be nil when quarantine is not wired up (tests).
+	reporter quarantineReporter
+
+	// beatSeq is a per-process monotonically increasing counter used to build
+	// idempotent failure event keys. It is confined to the heartbeater goroutine.
+	beatSeq int64
 
 	// following fields are mutable and should be accessed only by the
 	// heartbeater goroutine. In other words, confine these variables
@@ -60,12 +69,21 @@ type heartbeaterParams struct {
 	state          *serverState
 	starting       <-chan *workerInfo
 	finished       <-chan *base.TaskMessage
+
+	// Optional node quarantine wiring.
+	nodeID   string
+	reporter quarantineReporter
+	serverID string
 }
 
 func newHeartbeater(params heartbeaterParams) *heartbeater {
 	host, err := os.Hostname()
 	if err != nil {
 		host = "unknown-host"
+	}
+	serverID := params.serverID
+	if serverID == "" {
+		serverID = uuid.New().String()
 	}
 
 	return &heartbeater{
@@ -77,7 +95,9 @@ func newHeartbeater(params heartbeaterParams) *heartbeater {
 
 		host:           host,
 		pid:            os.Getpid(),
-		serverID:       uuid.New().String(),
+		serverID:       serverID,
+		nodeID:         params.nodeID,
+		reporter:       params.reporter,
 		concurrency:    params.concurrency,
 		queues:         params.queues,
 		strictPriority: params.strictPriority,
@@ -143,6 +163,9 @@ func (h *heartbeater) start(wg *sync.WaitGroup) {
 
 // beat extends lease for workers and writes server/worker info to redis.
 func (h *heartbeater) beat() {
+	h.beatSeq++
+	beatSeq := h.beatSeq
+
 	h.state.mu.Lock()
 	srvStatus := h.state.value.String()
 	h.state.mu.Unlock()
@@ -178,6 +201,12 @@ func (h *heartbeater) beat() {
 			idsByQueue[w.msg.Queue] = append(idsByQueue[w.msg.Queue], id)
 		} else {
 			w.lease.NotifyExpiration() // notify processor if the lease is expired
+			// A lease that expired while the worker was still holding the task is a
+			// node-level failure signal. Keyed by (task, deadline) so observing the same
+			// expired lease on consecutive beats is reported as one event, not many.
+			if h.reporter != nil {
+				h.reporter.reportFailure(failureLease, leaseEventKey(h.serverID, id, w.lease.Deadline()))
+			}
 		}
 	}
 
@@ -185,12 +214,22 @@ func (h *heartbeater) beat() {
 	// and short enough to expire quickly once the process is shut down or killed.
 	if err := h.broker.WriteServerState(&info, ws, h.interval*2); err != nil {
 		h.logger.Errorf("Failed to write server state data: %v", err)
+		if h.reporter != nil {
+			h.reporter.reportFailure(failureHeartbeat, heartbeatEventKey(h.serverID, beatSeq))
+		}
+	} else if h.reporter != nil {
+		// A successful heartbeat refreshes the node liveness marker and drives the
+		// automatic recovery of a quarantined node.
+		h.reporter.recordHeartbeat()
 	}
 
 	for qname, ids := range idsByQueue {
 		expirationTime, err := h.broker.ExtendLease(qname, ids...)
 		if err != nil {
 			h.logger.Errorf("Failed to extend lease for tasks %v: %v", ids, err)
+			if h.reporter != nil {
+				h.reporter.reportFailure(failureLease, leaseExtendEventKey(h.serverID, qname, beatSeq))
+			}
 			continue
 		}
 		for _, id := range ids {

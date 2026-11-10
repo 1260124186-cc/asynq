@@ -10,11 +10,13 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/hibiken/asynq/internal/base"
 	"github.com/hibiken/asynq/internal/log"
 	"github.com/hibiken/asynq/internal/rdb"
@@ -54,6 +56,7 @@ type Server struct {
 	healthchecker *healthchecker
 	janitor       *janitor
 	aggregator    *aggregator
+	quarantiner   *quarantiner
 }
 
 type serverState struct {
@@ -252,6 +255,36 @@ type Config struct {
 	// If unset or zero, default batch size of 100 is used.
 	// Make sure to not put a big number as the batch size to prevent a long-running script.
 	JanitorBatchSize int
+
+	// NodeID is the stable identity of this worker node, shared across process
+	// restarts. It is used to key the node quarantine state in redis so that
+	// isolation and its release survive restarts.
+	//
+	// Every live process using the same NodeID must have a unique server instance;
+	// two live instances claiming the same NodeID are treated as a node identity
+	// conflict and fail the quarantine reconciliation without changing state.
+	//
+	// If unset, the OS hostname is used.
+	NodeID string
+
+	// QuarantineFailureThreshold is the number of distinct failure events (missed
+	// heartbeats or expired task leases) observed on the node before it is
+	// quarantined and stops pulling new tasks.
+	//
+	// If unset or zero, a default of 3 is used.
+	QuarantineFailureThreshold int
+
+	// QuarantineRecoveryThreshold is the number of consecutive successful
+	// heartbeats required to automatically release a quarantined node.
+	//
+	// If unset or zero, a default of 3 is used.
+	QuarantineRecoveryThreshold int
+
+	// QuarantineReconcileInterval is the interval at which the node quarantine
+	// state persisted in redis is reloaded into the local dequeue gate.
+	//
+	// If unset or zero, a default of 5 seconds is used.
+	QuarantineReconcileInterval time.Duration
 }
 
 // GroupAggregator aggregates a group of tasks into one before the tasks are passed to the Handler.
@@ -424,6 +457,12 @@ const (
 	defaultJanitorInterval = 8 * time.Second
 
 	defaultJanitorBatchSize = 100
+
+	defaultQuarantineFailureThreshold = 3
+
+	defaultQuarantineRecoveryThreshold = 3
+
+	defaultQuarantineReconcileInterval = 5 * time.Second
 )
 
 // NewServer returns a new Server given a redis connection option
@@ -510,6 +549,41 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 	srvState := &serverState{value: srvStateNew}
 	cancels := base.NewCancelations()
 
+	// A stable node identity keeps quarantine state meaningful across restarts.
+	nodeID := cfg.NodeID
+	if nodeID == "" {
+		host, err := os.Hostname()
+		if err != nil {
+			host = "unknown-host"
+		}
+		nodeID = host
+	}
+	// The server ID identifies this particular process and is regenerated on every
+	// start, allowing conflict detection against another live instance of the node.
+	serverID := uuid.New().String()
+
+	failureThreshold := cfg.QuarantineFailureThreshold
+	if failureThreshold <= 0 {
+		failureThreshold = defaultQuarantineFailureThreshold
+	}
+	recoveryThreshold := cfg.QuarantineRecoveryThreshold
+	if recoveryThreshold <= 0 {
+		recoveryThreshold = defaultQuarantineRecoveryThreshold
+	}
+	quarantineReconcileInterval := cfg.QuarantineReconcileInterval
+	if quarantineReconcileInterval <= 0 {
+		quarantineReconcileInterval = defaultQuarantineReconcileInterval
+	}
+	quarantiner := newQuarantiner(quarantinerParams{
+		logger:            logger,
+		broker:            rdb,
+		nodeID:            nodeID,
+		serverID:          serverID,
+		failureThreshold:  failureThreshold,
+		recoveryThreshold: recoveryThreshold,
+		interval:          quarantineReconcileInterval,
+	})
+
 	syncer := newSyncer(syncerParams{
 		logger:     logger,
 		requestsCh: syncCh,
@@ -525,6 +599,9 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 		state:          srvState,
 		starting:       starting,
 		finished:       finished,
+		nodeID:         nodeID,
+		serverID:       serverID,
+		reporter:       quarantiner,
 	})
 	delayedTaskCheckInterval := cfg.DelayedTaskCheckInterval
 	if delayedTaskCheckInterval == 0 {
@@ -555,6 +632,7 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 		strictPriority:    cfg.StrictPriority,
 		errHandler:        cfg.ErrorHandler,
 		shutdownTimeout:   shutdownTimeout,
+		gate:              quarantiner,
 		starting:          starting,
 		finished:          finished,
 	})
@@ -616,6 +694,7 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 		healthchecker:    healthchecker,
 		janitor:          janitor,
 		aggregator:       aggregator,
+		quarantiner:      quarantiner,
 	}
 }
 
@@ -688,6 +767,9 @@ func (srv *Server) Start(handler Handler) error {
 	}
 	srv.logger.Info("Starting processing")
 
+	// Start the quarantiner first so its initial reconciliation loads any isolation
+	// state persisted from a previous process before the processor begins dequeuing.
+	srv.quarantiner.start(&srv.wg)
 	srv.heartbeater.start(&srv.wg)
 	srv.healthchecker.start(&srv.wg)
 	srv.subscriber.start(&srv.wg)
@@ -745,6 +827,9 @@ func (srv *Server) Shutdown() {
 	srv.aggregator.shutdown()
 	srv.healthchecker.shutdown()
 	srv.heartbeater.shutdown()
+	// The heartbeater is the only reporter, so stop the quarantiner after it to
+	// ensure no report can be sent once the reconciler goroutine has exited.
+	srv.quarantiner.shutdown()
 	srv.wg.Wait()
 
 	if !srv.sharedConnection {

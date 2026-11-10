@@ -68,6 +68,11 @@ type processor struct {
 	// cancelations is a set of cancel functions for all active tasks.
 	cancelations *base.Cancelations
 
+	// gate, when non-nil, reports whether the local node is quarantined. While
+	// quarantined the processor stops pulling new tasks but lets in-flight workers
+	// finish, so other healthy nodes keep consuming the queues.
+	gate quarantineGate
+
 	starting chan<- *workerInfo
 	finished chan<- *base.TaskMessage
 }
@@ -86,6 +91,7 @@ type processorParams struct {
 	strictPriority    bool
 	errHandler        ErrorHandler
 	shutdownTimeout   time.Duration
+	gate              quarantineGate
 	starting          chan<- *workerInfo
 	finished          chan<- *base.TaskMessage
 }
@@ -117,6 +123,7 @@ func newProcessor(params processorParams) *processor {
 		errHandler:        params.errHandler,
 		handler:           HandlerFunc(func(ctx context.Context, t *Task) error { return fmt.Errorf("handler not set") }),
 		shutdownTimeout:   params.shutdownTimeout,
+		gate:              params.gate,
 		starting:          params.starting,
 		finished:          params.finished,
 	}
@@ -172,6 +179,17 @@ func (p *processor) exec() {
 	case <-p.quit:
 		return
 	case p.sema <- struct{}{}: // acquire token
+		// While the node is quarantined it must not pull new tasks. In-flight workers
+		// are untouched and keep running; only new dequeues are paused so other healthy
+		// nodes continue consuming the queues. The gate is a local cache of the
+		// authoritative redis state, refreshed by the quarantiner.
+		if p.gate != nil && p.gate.IsQuarantined() {
+			p.logger.Debug("Node is quarantined; skipping dequeue and waiting for recovery")
+			jitter := rand.N(p.taskCheckInterval)
+			time.Sleep(p.taskCheckInterval/2 + jitter)
+			<-p.sema // release token
+			return
+		}
 		qnames := p.queues()
 		msg, leaseExpirationTime, err := p.broker.Dequeue(qnames...)
 		switch {

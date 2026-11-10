@@ -186,6 +186,140 @@ func WorkersKey(hostname string, pid int, serverID string) string {
 	return fmt.Sprintf("asynq:workers:{%s:%d:%s}", hostname, pid, serverID)
 }
 
+// Node quarantine statuses. The quarantine lifecycle is:
+// healthy -> quarantined -> released (and released -> healthy on the next failure).
+const (
+	// NodeQuarantineHealthy means the node is allowed to pull new tasks and is
+	// accumulating failure events before reaching the quarantine threshold.
+	NodeQuarantineHealthy = "healthy"
+
+	// NodeQuarantineQuarantined means the node is temporarily isolated and must
+	// not pull new tasks off queues; other nodes keep consuming normally.
+	NodeQuarantineQuarantined = "quarantined"
+
+	// NodeQuarantineReleased means a previously quarantined node has been
+	// released, either automatically after stable heartbeats or manually by an
+	// operator. The record is retained for audit and is re-armed on the next failure.
+	NodeQuarantineReleased = "released"
+)
+
+// Audit actions recorded in a node's quarantine audit log.
+const (
+	QuarantineActionQuarantined  = "quarantined"
+	QuarantineActionAutoReleased = "auto_released"
+	QuarantineActionManualClear  = "manual_clear"
+)
+
+// NodeQuarantineKey returns the redis hash key holding the quarantine record for
+// the given node. The node identity is wrapped in a hash tag so that every
+// per-node key (state, event markers, liveness marker and audit log) is pinned to
+// the same cluster hash slot, which keeps the reconciliation Lua scripts atomic
+// in a Redis Cluster deployment.
+func NodeQuarantineKey(nodeID string) string {
+	return "asynq:quarantine:{" + nodeID + "}"
+}
+
+// NodeQuarantineEventKey returns the redis key used as an idempotency marker for
+// a single failure event reported by the given node. Re-reporting the same event
+// hits this marker and is therefore not counted twice.
+func NodeQuarantineEventKey(nodeID, eventKey string) string {
+	return NodeQuarantineKey(nodeID) + ":evt:" + eventKey
+}
+
+// NodeQuarantineAliveKey returns the redis key marking a particular server
+// instance (identified by its server ID) as live for the given node identity.
+// The key carries a TTL and is refreshed on every successful heartbeat.
+func NodeQuarantineAliveKey(nodeID, serverID string) string {
+	return NodeQuarantineKey(nodeID) + ":alive:" + serverID
+}
+
+// NodeQuarantineAuditKey returns the redis list key holding the immutable audit
+// trail (quarantine, auto-release and manual clear entries) for the given node.
+func NodeQuarantineAuditKey(nodeID string) string {
+	return NodeQuarantineKey(nodeID) + ":audit"
+}
+
+// NodeQuarantineScanMatch returns the SCAN match pattern covering every key owned
+// by the node quarantine subsystem.
+func NodeQuarantineScanMatch() string {
+	return "asynq:quarantine:*"
+}
+
+// NodeQuarantine is the persisted, per-node quarantine record. It is stored in a
+// redis hash and survives process restarts.
+type NodeQuarantine struct {
+	// NodeID is the stable identity of the worker node, shared across restarts.
+	NodeID string
+
+	// ServerID is the identity of the server instance currently owning the record.
+	// It is used together with the liveness marker to detect node identity conflicts.
+	ServerID string
+
+	// Status is one of the NodeQuarantine* status constants.
+	Status string
+
+	// FailCount is the number of distinct failure events recorded for the current
+	// observing/quarantine window. Re-reporting the same event does not increment it.
+	FailCount int
+
+	// HealthyStreak is the number of consecutive successful heartbeats observed
+	// while the node is quarantined. It resets to zero on any new failure.
+	HealthyStreak int
+
+	// FirstFailAt is the time of the first failure event in the current window.
+	FirstFailAt time.Time
+
+	// LastFailAt is the time of the most recent distinct failure event.
+	LastFailAt time.Time
+
+	// QuarantinedAt is the time the node most recently entered the quarantined status.
+	QuarantinedAt time.Time
+
+	// ReleasedAt is the time the node most recently left the quarantined status.
+	ReleasedAt time.Time
+
+	// LastEventKey is the idempotency key of the most recently processed failure event.
+	LastEventKey string
+
+	// ClearedBy records the operator that manually cleared the quarantine, if any.
+	ClearedBy string
+
+	// ClearReason records the reason supplied with the most recent manual clear.
+	ClearReason string
+
+	// UpdatedAt is the time the record was last mutated.
+	UpdatedAt time.Time
+
+	// Version is a monotonically increasing revision bumped on every mutation; it
+	// is part of the corruption checks performed during reconciliation.
+	Version int64
+}
+
+// QuarantineAuditEntry is one immutable record in a node's quarantine audit trail.
+type QuarantineAuditEntry struct {
+	// At is the time the entry was written.
+	At time.Time `json:"at"`
+
+	// NodeID is the node identity the entry belongs to.
+	NodeID string `json:"node_id"`
+
+	// Action is one of the QuarantineAction* constants.
+	Action string `json:"action"`
+
+	// Operator is "system" for automatic transitions or the operator that
+	// performed a manual clear.
+	Operator string `json:"operator"`
+
+	// Reason is a human readable explanation of the entry.
+	Reason string `json:"reason"`
+
+	// ServerID is the server instance that produced the entry, when applicable.
+	ServerID string `json:"server_id"`
+
+	// Status is the resulting node status after the action.
+	Status string `json:"status"`
+}
+
 // SchedulerEntriesKey returns a redis key for the scheduler entries given scheduler ID.
 func SchedulerEntriesKey(schedulerID string) string {
 	return "asynq:schedulers:{" + schedulerID + "}"
@@ -741,4 +875,58 @@ type Broker interface {
 	PublishCancelation(id string) error
 
 	WriteResult(qname, id string, data []byte) (n int, err error)
+
+	// Node quarantine related methods.
+	//
+	// All mutating operations are executed atomically and are fail-safe: on a node
+	// identity conflict, corrupt persisted state or redis write failure they return
+	// an error without modifying the pre-existing quarantine record.
+
+	// ReportNodeFailure records a distinct failure event (e.g. a missed heartbeat
+	// or an expired task lease) for the given node and advances its quarantine
+	// state.
+	//
+	// Reporting is idempotent: re-reporting the same eventKey is a no-op that
+	// returns duplicated=true without incrementing the failure count, resetting the
+	// recovery streak or otherwise extending the isolation.
+	//
+	// failureThreshold is the number of distinct failure events that moves the node
+	// into the quarantined status. The method returns the resulting node status.
+	ReportNodeFailure(ctx context.Context, nodeID, serverID, eventKey string, failureThreshold int) (status string, duplicated bool, err error)
+
+	// RecordNodeHeartbeat records a successful heartbeat for the given node and
+	// refreshes the owner's liveness marker used for conflict detection.
+	//
+	// While the node is quarantined, each successful heartbeat increments a recovery
+	// streak; once the streak reaches recoveryThreshold the node is automatically
+	// released. A failed heartbeat must be reported through ReportNodeFailure rather
+	// than this method. The method returns the resulting node status.
+	RecordNodeHeartbeat(ctx context.Context, nodeID, serverID string, recoveryThreshold int) (status string, err error)
+
+	// GetNodeQuarantine returns the persisted quarantine record for the given node.
+	// It returns ErrNodeQuarantineNotFound when no record exists.
+	GetNodeQuarantine(nodeID string) (*NodeQuarantine, error)
+
+	// ReconcileNodeQuarantine performs a read-only, identity-checked reconciliation
+	// for the calling server instance and returns the authoritative node status.
+	//
+	// It performs no writes. It returns ErrNodeIdentityConflict when the record is
+	// owned by another still-live server instance, and ErrQuarantineStateCorrupt when
+	// the persisted record is malformed; in both cases the caller must leave its
+	// existing isolation state unchanged. When no record exists it returns the
+	// healthy status.
+	ReconcileNodeQuarantine(nodeID, serverID string) (status string, err error)
+
+	// ListNodeQuarantines returns all known node quarantine records, including
+	// healthy-observing and released nodes. Corrupt records are reported as an error.
+	ListNodeQuarantines() ([]*NodeQuarantine, error)
+
+	// ClearNodeQuarantine manually lifts the quarantine for the given node and
+	// appends an immutable audit entry. It fails without mutating state when the
+	// record is missing or corrupt.
+	ClearNodeQuarantine(ctx context.Context, nodeID, operator, reason string) error
+
+	// ListNodeQuarantineAudit returns the audit entries for the given node,
+	// oldest entry first.
+	ListNodeQuarantineAudit(nodeID string) ([]*QuarantineAuditEntry, error)
 }
