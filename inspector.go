@@ -5,6 +5,7 @@
 package asynq
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -1055,4 +1056,65 @@ func (i *Inspector) ListSchedulerEnqueueEvents(entryID string, opts ...ListOptio
 		events = append(events, &SchedulerEnqueueEvent{TaskID: e.TaskID, EnqueuedAt: e.EnqueuedAt})
 	}
 	return events, nil
+}
+
+// OutageWindow represents a time interval during which the Redis control
+// plane was unavailable. It is interpreted as a half-open interval [Start, End).
+type OutageWindow struct {
+	// Start marks the beginning of the outage (inclusive).
+	Start time.Time
+
+	// End marks the recovery from the outage (exclusive).
+	End time.Time
+}
+
+// RebaseReport summarizes a rebase run for a single queue.
+type RebaseReport struct {
+	// Queue is the name of the queue the report applies to.
+	Queue string
+
+	// Shifted is the number of not-yet-started tasks whose deadline and next
+	// process time were shifted during this invocation.
+	Shifted int64
+
+	// Skipped is the number of eligible tasks skipped because an earlier
+	// (possibly interrupted) invocation had already shifted them.
+	Skipped int64
+}
+
+// RebaseTaskTiming merges the given outage windows into their union and, for
+// each of the affected queues, shifts both the absolute deadline and the next
+// process time of every not-yet-started task (pending, scheduled and retry
+// states) by the union duration. Pending tasks are moved to the scheduled set
+// so they are not dequeued before the shifted process time.
+//
+// Tasks in active, completed, archived or aggregating state, and tasks in
+// queues not listed in queues, are never modified. The Timeout, Retry and
+// Retried fields are preserved; only the stored Deadline field is rewritten
+// (tasks without a deadline keep a zero deadline).
+//
+// The operation is idempotent: the same windows in any order resolve to the
+// same fingerprint and re-running it, including after a process interruption,
+// only processes the tasks that were not handled before. A conflicting window
+// registration or any unreadable/inconsistent task record fails the whole
+// operation before a task is mutated.
+func (i *Inspector) RebaseTaskTiming(queues []string, windows []OutageWindow) ([]*RebaseReport, error) {
+	for _, q := range queues {
+		if err := base.ValidateQueueName(q); err != nil {
+			return nil, err
+		}
+	}
+	rdbWindows := make([]rdb.Window, len(windows))
+	for i, w := range windows {
+		rdbWindows[i] = rdb.Window{Start: w.Start, End: w.End}
+	}
+	reports, err := i.rdb.RebaseTaskTiming(context.Background(), queues, rdbWindows)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*RebaseReport, len(reports))
+	for i, r := range reports {
+		out[i] = &RebaseReport{Queue: r.Queue, Shifted: r.Shifted, Skipped: r.Skipped}
+	}
+	return out, nil
 }
