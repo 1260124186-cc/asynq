@@ -1233,10 +1233,22 @@ const aggregationTimeout = 2 * time.Minute
 // the set ID. If not, it returns an empty string for the set ID.
 // The time for gracePeriod and maxDelay is computed relative to the time t.
 //
+// If a batch roster is registered for the group, the time- and size-based aggregation
+// criteria are ignored: the group is aggregated only when every roster member has arrived
+// and the waiting tasks can be reconciled against the roster exactly. A failed
+// reconciliation returns an error and leaves every task waiting in the group.
+//
 // Note: It assumes that this function is called at frequency less than or equal to the gracePeriod. In other words,
 // the function only checks the most recently added task against the given gracePeriod.
 func (r *RDB) AggregationCheck(qname, gname string, t time.Time, gracePeriod, maxDelay time.Duration, maxSize int) (string, error) {
 	var op errors.Op = "RDB.AggregationCheck"
+	rosterExists, err := r.client.Exists(context.Background(), base.RosterKey(qname, gname)).Result()
+	if err != nil {
+		return "", errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "exists", Err: err})
+	}
+	if rosterExists == 1 {
+		return r.rosterAggregationCheck(op, qname, gname)
+	}
 	aggregationSetID := uuid.NewString()
 	expireTime := r.clock.Now().Add(aggregationTimeout)
 	keys := []string{
@@ -1262,6 +1274,110 @@ func (r *RDB) AggregationCheck(qname, gname string, t time.Time, gracePeriod, ma
 		return "", nil
 	case 1:
 		return aggregationSetID, nil
+	default:
+		return "", errors.E(op, errors.Internal, fmt.Sprintf("unexpected return value from lua script: %d", n))
+	}
+}
+
+// rosterAggregationCheckCmd reconciles the tasks waiting in a group against the
+// group's batch roster and creates an aggregation set only when every roster
+// member has arrived and every waiting task can be verified against the roster.
+//
+// The script performs all read-only verification before any write, so any error
+// return leaves the group, the tasks and the roster exactly as they were.
+//
+// KEYS[1] -> asynq:{<qname>}:g:<gname>:roster
+// KEYS[2] -> asynq:{<qname>}:g:<gname>:roster:members
+// KEYS[3] -> asynq:{<qname>}:g:<gname>
+// KEYS[4] -> asynq:{<qname>}:g:<gname>:<aggregation_set_id>
+// KEYS[5] -> asynq:{<qname>}:aggregation_sets
+// KEYS[6] -> asynq:{<qname>}:groups
+// -------
+// ARGV[1] -> aggregation set expire time in unix time
+// ARGV[2] -> group name
+// ARGV[3] -> task key prefix
+//
+// Output:
+// Returns 1 if an aggregation set was created
+// Returns 0 if the group is not ready (members missing or aggregation already in progress)
+// Returns -1 if the group contains a task that is not in the roster
+// Returns -2 if a roster member's task cannot be verified (missing task key or group mismatch)
+var rosterAggregationCheckCmd = redis.NewScript(`
+if redis.call("EXISTS", KEYS[1]) == 0 then
+	return 0
+end
+if redis.call("HGET", KEYS[1], "state") == "aggregating" then
+	return 0
+end
+
+local rosterMembers = redis.call("SMEMBERS", KEYS[2])
+local groupMembers = redis.call("ZRANGE", KEYS[3], 0, -1)
+
+local rosterSet = {}
+for _, id in ipairs(rosterMembers) do
+	rosterSet[id] = 1
+end
+local groupSet = {}
+for _, id in ipairs(groupMembers) do
+	groupSet[id] = 1
+	if not rosterSet[id] then
+		return -1
+	end
+end
+for _, id in ipairs(rosterMembers) do
+	if not groupSet[id] then
+		return 0
+	end
+end
+
+for _, id in ipairs(rosterMembers) do
+	local taskKey = ARGV[3] .. id
+	if redis.call("EXISTS", taskKey) == 0 then
+		return -2
+	end
+	if redis.call("HGET", taskKey, "group") ~= ARGV[2] then
+		return -2
+	end
+end
+
+local res = redis.call("ZRANGE", KEYS[3], 0, -1, "WITHSCORES")
+for i=1, table.getn(res)-1, 2 do
+	redis.call("ZADD", KEYS[4], tonumber(res[i+1]), res[i])
+end
+redis.call("ZREMRANGEBYRANK", KEYS[3], 0, -1)
+redis.call("ZADD", KEYS[5], ARGV[1], KEYS[4])
+redis.call("SREM", KEYS[6], ARGV[2])
+redis.call("HSET", KEYS[1], "state", "aggregating", "agg_set", KEYS[4])
+return 1
+`)
+
+// rosterAggregationCheck runs the barrier-style aggregation check for a roster-gated group.
+func (r *RDB) rosterAggregationCheck(op errors.Op, qname, gname string) (string, error) {
+	aggregationSetID := uuid.NewString()
+	keys := []string{
+		base.RosterKey(qname, gname),
+		base.RosterMembersKey(qname, gname),
+		base.GroupKey(qname, gname),
+		base.AggregationSetKey(qname, gname, aggregationSetID),
+		base.AllAggregationSets(qname),
+		base.AllGroups(qname),
+	}
+	argv := []interface{}{
+		r.clock.Now().Add(aggregationTimeout).Unix(),
+		gname,
+		base.TaskKeyPrefix(qname),
+	}
+	n, err := r.runScriptWithErrorCode(context.Background(), op, rosterAggregationCheckCmd, keys, argv...)
+	if err != nil {
+		return "", err
+	}
+	switch n {
+	case 0:
+		return "", nil
+	case 1:
+		return aggregationSetID, nil
+	case -1, -2:
+		return "", errors.E(op, errors.FailedPrecondition, errors.ErrRosterMemberMismatch)
 	default:
 		return "", errors.E(op, errors.Internal, fmt.Sprintf("unexpected return value from lua script: %d", n))
 	}
@@ -1348,8 +1464,10 @@ func (r *RDB) DeleteAggregationSet(ctx context.Context, qname, gname, setID stri
 }
 
 // KEYS[1] -> asynq:{<qname>}:aggregation_sets
+// KEYS[2] -> asynq:{<qname>}:groups
 // -------
 // ARGV[1] -> current time in unix time
+// ARGV[2] -> group key prefix (asynq:{<qname>}:g:)
 var reclaimStateAggregationSetsCmd = redis.NewScript(`
 local staleSetKeys = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", ARGV[1])
 for _, key in ipairs(staleSetKeys) do
@@ -1360,6 +1478,13 @@ for _, key in ipairs(staleSetKeys) do
 		redis.call("ZADD", groupKey, tonumber(res[i+1]), res[i])
 	end
 	redis.call("DEL", key)
+	local rosterKey = groupKey .. ":roster"
+	if redis.call("EXISTS", rosterKey) == 1 then
+		redis.call("HSET", rosterKey, "state", "waiting")
+		redis.call("HDEL", rosterKey, "agg_set")
+		local gname = string.sub(groupKey, string.len(ARGV[2]) + 1)
+		redis.call("SADD", KEYS[2], gname)
+	end
 end
 redis.call("ZREMRANGEBYSCORE", KEYS[1], "-inf", ARGV[1])
 return redis.status_reply("OK")
@@ -1370,7 +1495,167 @@ return redis.status_reply("OK")
 func (r *RDB) ReclaimStaleAggregationSets(qname string) error {
 	var op errors.Op = "RDB.ReclaimStaleAggregationSets"
 	return r.runScript(context.Background(), op, reclaimStateAggregationSetsCmd,
-		[]string{base.AllAggregationSets(qname)}, r.clock.Now().Unix())
+		[]string{base.AllAggregationSets(qname), base.AllGroups(qname)},
+		r.clock.Now().Unix(), base.GroupKeyPrefix(qname))
+}
+
+// applyGroupRosterCmd registers or replaces the batch roster of a group.
+//
+// The script is idempotent: applying the same batch id with the same member
+// set does not mutate anything. Applying the same batch id with a different
+// member set fails without any write. A different batch id replaces the
+// roster; members dropped from the latest roster are removed from the group
+// only while they are still waiting there (their execution has not started).
+//
+// A roster left in the "aggregating" state by a crash after its aggregation
+// set was consumed is treated as finished: once the tracked set no longer
+// exists, the request takes over and rewrites the roster in "waiting" state.
+//
+// KEYS[1] -> asynq:{<qname>}:g:<gname>:roster
+// KEYS[2] -> asynq:{<qname>}:g:<gname>:roster:members
+// KEYS[3] -> asynq:{<qname>}:g:<gname>
+// KEYS[4] -> asynq:{<qname>}:groups
+// KEYS[5] -> asynq:{<qname>}:aggregation_sets
+// -------
+// ARGV[1] -> batch id
+// ARGV[2] -> current time in unix time
+// ARGV[3] -> task key prefix
+// ARGV[4] -> group name
+// ARGV[5...] -> member task IDs
+//
+// Output:
+// Returns 1 if the roster was created or replaced
+// Returns 0 if the request was a no-op (same batch id, same members)
+// Returns -1 if the request contains duplicate member IDs
+// Returns -2 if the batch id conflicts with an existing roster of different members
+// Returns -3 if an aggregation is already in progress for the current roster
+var applyGroupRosterCmd = redis.NewScript(`
+local seen = {}
+for i=5, #ARGV do
+	local id = ARGV[i]
+	if seen[id] then
+		return -1
+	end
+	seen[id] = 1
+end
+
+if redis.call("EXISTS", KEYS[1]) == 1 then
+	local state = redis.call("HGET", KEYS[1], "state")
+	local aggSet = redis.call("HGET", KEYS[1], "agg_set")
+	if state == "aggregating" and aggSet and redis.call("ZSCORE", KEYS[5], aggSet) then
+		return -3
+	end
+	if state ~= "aggregating" and redis.call("HGET", KEYS[1], "batch_id") == ARGV[1] then
+		local oldMembers = redis.call("SMEMBERS", KEYS[2])
+		if table.getn(oldMembers) ~= (#ARGV - 4) then
+			return -2
+		end
+		for _, id in ipairs(oldMembers) do
+			if not seen[id] then
+				return -2
+			end
+		end
+		return 0
+	end
+	local oldMembers = redis.call("SMEMBERS", KEYS[2])
+	for _, id in ipairs(oldMembers) do
+		if not seen[id] and redis.call("ZSCORE", KEYS[3], id) then
+			redis.call("ZREM", KEYS[3], id)
+			redis.call("DEL", ARGV[3] .. id)
+		end
+	end
+	if redis.call("ZCARD", KEYS[3]) == 0 then
+		redis.call("SREM", KEYS[4], ARGV[4])
+	end
+end
+
+redis.call("DEL", KEYS[2])
+for i=5, #ARGV do
+	redis.call("SADD", KEYS[2], ARGV[i])
+end
+redis.call("HSET", KEYS[1],
+	"batch_id", ARGV[1],
+	"state", "waiting",
+	"updated_at", ARGV[2])
+redis.call("HDEL", KEYS[1], "agg_set")
+return 1
+`)
+
+// ApplyGroupRoster registers or updates the batch roster for the given group.
+func (r *RDB) ApplyGroupRoster(ctx context.Context, qname, gname, batchID string, members []string) error {
+	var op errors.Op = "rdb.ApplyGroupRoster"
+	if len(members) == 0 {
+		return errors.E(op, errors.FailedPrecondition, "batch roster must contain at least one member")
+	}
+	keys := []string{
+		base.RosterKey(qname, gname),
+		base.RosterMembersKey(qname, gname),
+		base.GroupKey(qname, gname),
+		base.AllGroups(qname),
+		base.AllAggregationSets(qname),
+	}
+	argv := make([]interface{}, 0, len(members)+4)
+	argv = append(argv, batchID, r.clock.Now().Unix(), base.TaskKeyPrefix(qname), gname)
+	seen := make(map[string]struct{}, len(members))
+	for _, id := range members {
+		if _, ok := seen[id]; ok {
+			return errors.E(op, errors.FailedPrecondition, errors.ErrRosterDuplicateMember)
+		}
+		seen[id] = struct{}{}
+		argv = append(argv, id)
+	}
+	n, err := r.runScriptWithErrorCode(ctx, op, applyGroupRosterCmd, keys, argv...)
+	if err != nil {
+		return err
+	}
+	switch n {
+	case 0, 1:
+		return nil
+	case -1:
+		return errors.E(op, errors.FailedPrecondition, errors.ErrRosterDuplicateMember)
+	case -2:
+		return errors.E(op, errors.FailedPrecondition, errors.ErrRosterBatchConflict)
+	case -3:
+		return errors.E(op, errors.FailedPrecondition, errors.ErrRosterAggregationInProgress)
+	default:
+		return errors.E(op, errors.Internal, fmt.Sprintf("unexpected return value from lua script: %d", n))
+	}
+}
+
+// clearGroupRosterCmd deletes the roster of a group once the aggregation set
+// it tracks has been consumed. It is a no-op when the roster does not exist
+// or tracks a different aggregation set.
+//
+// KEYS[1] -> asynq:{<qname>}:g:<gname>:roster
+// KEYS[2] -> asynq:{<qname>}:g:<gname>:roster:members
+// -------
+// ARGV[1] -> expected aggregation set key
+//
+// Output:
+// Returns 1 if the roster was deleted
+// Returns 0 otherwise
+var clearGroupRosterCmd = redis.NewScript(`
+if redis.call("EXISTS", KEYS[1]) == 0 then
+	return 0
+end
+if redis.call("HGET", KEYS[1], "agg_set") ~= ARGV[1] then
+	return 0
+end
+redis.call("DEL", KEYS[1])
+redis.call("DEL", KEYS[2])
+return 1
+`)
+
+// ClearGroupRoster removes the roster of the given group once the aggregation set
+// identified by aggregationSetID has been consumed.
+func (r *RDB) ClearGroupRoster(ctx context.Context, qname, gname, aggregationSetID string) error {
+	var op errors.Op = "rdb.ClearGroupRoster"
+	keys := []string{
+		base.RosterKey(qname, gname),
+		base.RosterMembersKey(qname, gname),
+	}
+	argv := []interface{}{base.AggregationSetKey(qname, gname, aggregationSetID)}
+	return r.runScript(ctx, op, clearGroupRosterCmd, keys, argv...)
 }
 
 // KEYS[1] -> asynq:{<qname>}:completed

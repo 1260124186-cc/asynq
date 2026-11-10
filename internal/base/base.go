@@ -225,11 +225,37 @@ func AllGroups(qname string) string {
 	return QueueKeyPrefix(qname) + "groups"
 }
 
+// RosterKey returns a redis key used to store the batch roster metadata
+// (batch id, state, aggregation set) for the given group.
+//
+// A batch roster is a HASH and only exists while the group is gated by
+// a roster, i.e. from the time the roster is applied until the group's
+// tasks have been aggregated and the resulting aggregation set is consumed.
+func RosterKey(qname, gkey string) string {
+	return GroupKey(qname, gkey) + ":roster"
+}
+
+// RosterMembersKey returns a redis key used to store the set of task IDs
+// that are expected to join the given group according to the latest roster.
+func RosterMembersKey(qname, gkey string) string {
+	return GroupKey(qname, gkey) + ":roster:members"
+}
+
 // AllAggregationSets returns a redis key used to store all aggregation sets (set of tasks staged to be aggregated)
 // in a given queue.
 func AllAggregationSets(qname string) string {
 	return QueueKeyPrefix(qname) + "aggregation_sets"
 }
+
+// Roster states stored in the HASH at RosterKey under the "state" field.
+const (
+	// RosterStateWaiting means the group is waiting for every roster member
+	// to arrive before it can be aggregated.
+	RosterStateWaiting = "waiting"
+	// RosterStateAggregating means the members were moved into an aggregation
+	// set and the aggregated task is being produced.
+	RosterStateAggregating = "aggregating"
+)
 
 // TaskMessage is the internal representation of a task with additional metadata fields.
 // Serialized data of this type gets written to redis.
@@ -724,6 +750,19 @@ type Broker interface {
 	ReadAggregationSet(qname, gname, aggregationSetID string) ([]*TaskMessage, time.Time, error)
 	DeleteAggregationSet(ctx context.Context, qname, gname, aggregationSetID string) error
 	ReclaimStaleAggregationSets(qname string) error
+
+	// Batch roster related methods.
+	//
+	// ApplyGroupRoster registers or updates the batch roster for the given group.
+	// Tasks in a roster-gated group are only aggregated once every roster member
+	// has arrived. Applying the same batch id with the same members is a no-op;
+	// applying the same batch id with different members, or applying a roster
+	// while an aggregation is in progress, fails without mutating any state.
+	ApplyGroupRoster(ctx context.Context, qname, gname, batchID string, members []string) error
+	// ClearGroupRoster removes the roster of the given group once its aggregation
+	// set, identified by aggregationSetID, has been consumed. It is a no-op when
+	// the group has no roster or the roster tracks a different aggregation set.
+	ClearGroupRoster(ctx context.Context, qname, gname, aggregationSetID string) error
 
 	// Task retention related method
 	DeleteExpiredCompletedTasks(qname string, batchSize int) error

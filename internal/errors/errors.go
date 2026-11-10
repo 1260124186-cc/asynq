@@ -174,6 +174,22 @@ var (
 
 	// ErrTaskIdConflict indicates that another task with the same task ID already exist
 	ErrTaskIdConflict = errors.New("task id conflicts with another task")
+
+	// ErrRosterDuplicateMember indicates that a batch roster contains duplicate member IDs.
+	ErrRosterDuplicateMember = errors.New("batch roster contains duplicate members")
+
+	// ErrRosterBatchConflict indicates that a roster applied with an existing batch id
+	// declares a different set of members than the roster already stored for that batch.
+	ErrRosterBatchConflict = errors.New("batch id conflicts with an existing roster that has different members")
+
+	// ErrRosterMemberMismatch indicates that the tasks waiting in the group cannot be
+	// reconciled against the roster: the group contains an unexpected task, or a roster
+	// member's task cannot be verified. The group is left untouched and keeps waiting.
+	ErrRosterMemberMismatch = errors.New("group tasks cannot be reconciled with the batch roster")
+
+	// ErrRosterAggregationInProgress indicates that the roster cannot be replaced because
+	// the group's members have already been moved into an aggregation set.
+	ErrRosterAggregationInProgress = errors.New("cannot replace a batch roster while its aggregation is in progress")
 )
 
 // TaskNotFoundError indicates that a task with the given ID does not exist

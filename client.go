@@ -618,3 +618,88 @@ func (c *Client) addToGroup(ctx context.Context, msg *base.TaskMessage, group st
 	}
 	return c.broker.AddToGroup(ctx, msg, group)
 }
+
+// Roster-related errors returned by ApplyGroupRoster and detected during
+// roster-gated aggregation. Callers can use errors.Is to test for them.
+var (
+	// ErrRosterDuplicateMember indicates that a batch roster contains duplicate member IDs.
+	ErrRosterDuplicateMember = errors.ErrRosterDuplicateMember
+	// ErrRosterBatchConflict indicates that a roster applied with an existing batch id
+	// declares a different set of members than the roster already stored for that batch.
+	ErrRosterBatchConflict = errors.ErrRosterBatchConflict
+	// ErrRosterMemberMismatch indicates that the tasks waiting in a roster-gated group
+	// cannot be reconciled against the roster. The tasks keep waiting in the group.
+	ErrRosterMemberMismatch = errors.ErrRosterMemberMismatch
+	// ErrRosterAggregationInProgress indicates that a roster cannot be replaced while
+	// the group's members are being aggregated.
+	ErrRosterAggregationInProgress = errors.ErrRosterAggregationInProgress
+)
+
+// GroupRoster declares the exhaustive list of task IDs that are expected to
+// join a group for one import batch. A group with a roster ignores the
+// grace period, max delay and max size aggregation settings and produces its
+// aggregated task only after every member has arrived and the waiting tasks
+// match the roster exactly.
+//
+// Members are task IDs, i.e. the IDs assigned to tasks via the TaskID option
+// when they are enqueued with the Group option.
+type GroupRoster struct {
+	// Queue to which the group belongs. If empty, the default queue is used.
+	Queue string
+
+	// Group is the name of the group gated by this roster. It must not be empty.
+	Group string
+
+	// BatchID identifies the roster content within a group. Re-applying the same
+	// BatchID with the same Members is a no-op; re-applying it with different
+	// Members fails with ErrRosterBatchConflict. To change the member list,
+	// apply a roster with a new BatchID.
+	BatchID string
+
+	// Members is the exhaustive, duplicate-free list of task IDs expected to
+	// join the group before it is aggregated.
+	Members []string
+}
+
+// ApplyGroupRoster registers or updates the batch roster of a group.
+//
+// The latest roster always wins: applying a roster with a new BatchID replaces
+// the previous roster, and members removed from the latest roster stop
+// participating as long as their tasks are still waiting in the group.
+//
+// The call is idempotent: applying the same BatchID with the same Members
+// repeatedly, or retrying after a process restart, does not create extra
+// members or aggregated tasks.
+//
+// It returns ErrRosterDuplicateMember, ErrRosterBatchConflict or
+// ErrRosterAggregationInProgress when the request cannot be applied; in those
+// cases the group and its waiting tasks are left untouched.
+func (c *Client) ApplyGroupRoster(ctx context.Context, r GroupRoster) error {
+	qname := r.Queue
+	if qname == "" {
+		qname = base.DefaultQueueName
+	}
+	if err := base.ValidateQueueName(qname); err != nil {
+		return err
+	}
+	if isBlank(r.Group) {
+		return errors.New("group cannot be empty")
+	}
+	if isBlank(r.BatchID) {
+		return errors.New("batch id cannot be empty")
+	}
+	if len(r.Members) == 0 {
+		return errors.New("batch roster must contain at least one member")
+	}
+	seen := make(map[string]struct{}, len(r.Members))
+	for _, id := range r.Members {
+		if isBlank(id) {
+			return errors.New("batch roster member id cannot be empty")
+		}
+		if _, ok := seen[id]; ok {
+			return errors.ErrRosterDuplicateMember
+		}
+		seen[id] = struct{}{}
+	}
+	return c.broker.ApplyGroupRoster(ctx, qname, r.Group, r.BatchID, r.Members)
+}

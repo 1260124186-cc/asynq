@@ -306,3 +306,21 @@ func (tb *TestBroker) ReclaimStaleAggregationSets(qname string) error {
 	}
 	return tb.real.ReclaimStaleAggregationSets(qname)
 }
+
+func (tb *TestBroker) ApplyGroupRoster(ctx context.Context, qname, gname, batchID string, members []string) error {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.sleeping {
+		return errRedisDown
+	}
+	return tb.real.ApplyGroupRoster(ctx, qname, gname, batchID, members)
+}
+
+func (tb *TestBroker) ClearGroupRoster(ctx context.Context, qname, gname, aggregationSetID string) error {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.sleeping {
+		return errRedisDown
+	}
+	return tb.real.ClearGroupRoster(ctx, qname, gname, aggregationSetID)
+}

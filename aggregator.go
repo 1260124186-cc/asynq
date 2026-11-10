@@ -169,6 +169,14 @@ func (a *aggregator) aggregate(t time.Time) {
 			if err := a.broker.DeleteAggregationSet(ctx, qname, gname, aggregationSetID); err != nil {
 				a.logger.Warnf("Failed to delete aggregation set: queue=%q, group=%q, setID=%q",
 					qname, gname, aggregationSetID)
+				cancel()
+				continue
+			}
+			// Remove the batch roster, if any, now that the aggregated task has been enqueued.
+			// It is a no-op for groups without a roster.
+			if err := a.broker.ClearGroupRoster(ctx, qname, gname, aggregationSetID); err != nil {
+				a.logger.Warnf("Failed to clear batch roster: queue=%q, group=%q, setID=%q",
+					qname, gname, aggregationSetID)
 			}
 			cancel()
 		}
